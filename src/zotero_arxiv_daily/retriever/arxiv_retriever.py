@@ -114,6 +114,10 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
+def _get_http_status(exc: arxiv.HTTPError) -> int | None:
+    return getattr(exc, "status", None) or getattr(exc, "status_code", None)
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -125,7 +129,7 @@ class ArxivRetriever(BaseRetriever):
         client = arxiv.Client(num_retries=0, delay_seconds=10, page_size=100)
         client._session = TimeoutSession()
 
-        query = '+'.join(self.config.source.arxiv.category)
+        query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
 
         feed_response = requests.get(
@@ -135,7 +139,7 @@ class ArxivRetriever(BaseRetriever):
         feed_response.raise_for_status()
         feed = feedparser.parse(feed_response.content)
 
-        if 'Feed error for query' in feed.feed.get("title", ""):
+        if "Feed error for query" in feed.feed.get("title", ""):
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
 
         raw_papers = []
@@ -149,10 +153,16 @@ class ArxivRetriever(BaseRetriever):
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
-        bar = tqdm(total=len(all_paper_ids))
-        batch_size = 50
-        max_batch_retries = 8
-        batch_retry_delay = 60
+        max_fetch_paper_num = self.config.source.arxiv.get("max_fetch_paper_num", None)
+        if max_fetch_paper_num is not None:
+            all_paper_ids = all_paper_ids[: int(max_fetch_paper_num)]
+
+        batch_size = max(1, int(self.config.source.arxiv.get("api_batch_size", 10)))
+        batch_delay = max(0, int(self.config.source.arxiv.get("api_batch_delay", 30)))
+        max_batch_retries = max(1, int(self.config.source.arxiv.get("api_max_retries", 6)))
+        batch_retry_delay = max(1, int(self.config.source.arxiv.get("api_retry_delay", 300)))
+        skip_failed_batches = bool(self.config.source.arxiv.get("skip_failed_batches", True))
+
         retryable_statuses = {429, 500, 502, 503, 504}
         retryable_request_errors = (
             requests.exceptions.Timeout,
@@ -161,45 +171,72 @@ class ArxivRetriever(BaseRetriever):
             requests.exceptions.SSLError,
         )
 
+        logger.info(
+            f"Fetching {len(all_paper_ids)} arXiv paper metadata items "
+            f"with batch_size={batch_size}, batch_delay={batch_delay}s"
+        )
+
+        bar = tqdm(total=len(all_paper_ids))
+
         try:
             for i in range(0, len(all_paper_ids), batch_size):
-                batch_index = i // batch_size
-                search = arxiv.Search(id_list=all_paper_ids[i:i + batch_size])
+                ids = all_paper_ids[i:i + batch_size]
+                batch_index = i // batch_size + 1
+                search = arxiv.Search(id_list=ids)
 
                 for attempt in range(max_batch_retries):
                     try:
                         batch = list(client.results(search))
-                        bar.update(len(batch))
                         raw_papers.extend(batch)
+                        bar.update(len(ids))
                         break
 
                     except arxiv.HTTPError as exc:
-                        should_retry = exc.status in retryable_statuses
+                        status = _get_http_status(exc)
+                        should_retry = status in retryable_statuses
 
                         if should_retry and attempt < max_batch_retries - 1:
-                            wait = min(batch_retry_delay * (2 ** attempt), 15 * 60)
+                            wait = min(batch_retry_delay * (2 ** attempt), 30 * 60)
                             logger.warning(
-                                f"arXiv API HTTP {exc.status} on batch {batch_index}, "
+                                f"arXiv API HTTP {status} on batch {batch_index}; "
                                 f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
                             )
                             sleep(wait)
-                        else:
-                            raise
+                            continue
+
+                        if should_retry and skip_failed_batches:
+                            logger.error(
+                                f"Skipping arXiv batch {batch_index} after "
+                                f"{max_batch_retries} failed attempts: HTTP {status}"
+                            )
+                            bar.update(len(ids))
+                            break
+
+                        raise
 
                     except retryable_request_errors as exc:
                         if attempt < max_batch_retries - 1:
-                            wait = min(batch_retry_delay * (2 ** attempt), 15 * 60)
+                            wait = min(batch_retry_delay * (2 ** attempt), 30 * 60)
                             logger.warning(
                                 f"arXiv API network error on batch {batch_index}: "
                                 f"{type(exc).__name__}: {exc}; "
                                 f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
                             )
                             sleep(wait)
-                        else:
-                            raise
+                            continue
+
+                        if skip_failed_batches:
+                            logger.error(
+                                f"Skipping arXiv batch {batch_index} after "
+                                f"{max_batch_retries} failed attempts: {type(exc).__name__}"
+                            )
+                            bar.update(len(ids))
+                            break
+
+                        raise
 
                 if i + batch_size < len(all_paper_ids):
-                    sleep(10)
+                    sleep(batch_delay)
 
         finally:
             bar.close()
